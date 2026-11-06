@@ -3,9 +3,13 @@ name: Build RG-X60 New (ImmortalWrt 24.10)
 # This repository *is* the firmware source tree; the checkout is what gets
 # compiled. The build logic itself lives in the ZeroWrt pipeline, which is
 # checked out next to it: feed pruning, the device .config, the in-tree
-# customisations and the OTA metadata all stay in one place instead of being
+# customisations and the package set all stay in one place instead of being
 # duplicated here. The steps below are the same sequence ZeroWrt runs, pointed
 # at its `ruijie_rg-x60-new-2410` profile (24.10 tree, MTK wireless, GCC 14).
+#
+# No OTA: that profile has `Source.ota` off, so the image ships without
+# luci-app-ota and the pipeline's ota subcommands stand down. The firmware is
+# flashed by hand.
 
 on:
   workflow_dispatch:
@@ -26,14 +30,6 @@ on:
         description: "WiFi password: 8-63 safe characters"
         required: true
         default: "1234567890"
-      ota_url:
-        description: "OTA index URL (empty = GitHub Pages of this repository)"
-        required: false
-        default: ""
-      ota_cname:
-        description: "Optional custom domain for the OTA download page"
-        required: false
-        default: ""
       cache_toolchain:
         description: "Restore the toolchain cache when available"
         type: boolean
@@ -109,7 +105,10 @@ jobs:
         run: python3 "$PIPELINE/scripts/zerowrt.py" source feeds-install --tree "$ZEROWRT_SOURCE_DIR"
 
       - name: Add external packages
-        run: python3 "$PIPELINE/scripts/zerowrt.py" packages add --tree "$ZEROWRT_SOURCE_DIR"
+        run: |
+          python3 "$PIPELINE/scripts/zerowrt.py" packages add \
+            --tree "$ZEROWRT_SOURCE_DIR" \
+            --device "$ZEROWRT_DEVICE"
 
       - name: Apply core customisations
         env:
@@ -133,23 +132,6 @@ jobs:
           python3 "$PIPELINE/scripts/zerowrt.py" config apply \
             --tree "$ZEROWRT_SOURCE_DIR" \
             --device "$ZEROWRT_DEVICE"
-
-      - name: Embed OTA metadata
-        env:
-          OTA_URL_INPUT: ${{ inputs.ota_url }}
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/dist"
-          if [ -n "$OTA_URL_INPUT" ]; then
-            OTA_URL="$OTA_URL_INPUT"
-          else
-            OWNER="$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
-            REPO_NAME="${GITHUB_REPOSITORY#*/}"
-            OTA_URL="https://${OWNER}.github.io/${REPO_NAME}/ota.json"
-          fi
-          python3 "$PIPELINE/scripts/zerowrt.py" ota embed \
-            --tree "$ZEROWRT_SOURCE_DIR" \
-            --api-url "$OTA_URL" \
-            --emit "$GITHUB_WORKSPACE/ota-meta.json"
 
       - name: Restore toolchain cache
         if: ${{ inputs.cache_toolchain }}
@@ -182,14 +164,6 @@ jobs:
           python3 "$PIPELINE/scripts/zerowrt.py" build collect \
             --tree "$ZEROWRT_SOURCE_DIR" \
             --out "$GITHUB_WORKSPACE/dist"
-
-      - name: Generate OTA index
-        run: |
-          python3 "$PIPELINE/scripts/zerowrt.py" ota index \
-            --tree "$ZEROWRT_SOURCE_DIR" \
-            --dist "$GITHUB_WORKSPACE/dist" \
-            --repo "$GITHUB_REPOSITORY" \
-            --tag "$ZEROWRT_DEVICE"
 
       - name: Build summary
         if: success()
@@ -228,21 +202,6 @@ jobs:
           prerelease: false
           overwrite_files: true
           fail_on_unmatched_files: false
-
-      - name: Publish OTA page
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OTA_CNAME: ${{ inputs.ota_cname }}
-        run: |
-          python3 "$PIPELINE/scripts/zerowrt.py" ota publish \
-            --tree "$ZEROWRT_SOURCE_DIR" \
-            --dist "$GITHUB_WORKSPACE/dist" \
-            --repo "$GITHUB_REPOSITORY" \
-            --tag "$ZEROWRT_DEVICE" \
-            --branch gh-pages \
-            --site "$ZEROWRT_SOURCE_DIR/package/new/luci-app-ota/site" \
-            --cname "$OTA_CNAME"
 
       - name: Trim build logs
         if: failure()
