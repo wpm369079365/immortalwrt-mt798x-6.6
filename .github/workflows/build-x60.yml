@@ -1,0 +1,264 @@
+name: Build RG-X60 New (ImmortalWrt 24.10)
+
+# This repository *is* the firmware source tree; the checkout is what gets
+# compiled. The build logic itself lives in the ZeroWrt pipeline, which is
+# checked out next to it: feed pruning, the device .config, the in-tree
+# customisations and the OTA metadata all stay in one place instead of being
+# duplicated here. The steps below are the same sequence ZeroWrt runs, pointed
+# at its `ruijie_rg-x60-new-2410` profile (24.10 tree, MTK wireless, GCC 14).
+
+on:
+  workflow_dispatch:
+    inputs:
+      lan_ip:
+        description: "LAN IP (management address)"
+        required: true
+        default: "10.0.0.1"
+      root_password:
+        description: "Root password (at least 8 characters)"
+        required: true
+        default: "password"
+      wifi_name:
+        description: "WiFi name prefix; -2.4G / -5G is appended"
+        required: true
+        default: "ZeroWrt"
+      wifi_password:
+        description: "WiFi password: 8-63 safe characters"
+        required: true
+        default: "1234567890"
+      ota_url:
+        description: "OTA index URL (empty = GitHub Pages of this repository)"
+        required: false
+        default: ""
+      ota_cname:
+        description: "Optional custom domain for the OTA download page"
+        required: false
+        default: ""
+      cache_toolchain:
+        description: "Restore the toolchain cache when available"
+        type: boolean
+        required: true
+        default: true
+      pipeline_ref:
+        description: "ZeroWrt ref that holds the build pipeline and the 24.10 profile"
+        required: true
+        default: "feat/padavanonly-2410"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: x60-2410-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  BUILD_ROOT: /builder
+  ZEROWRT_SOURCE_DIR: /builder/source
+  ZEROWRT_DEVICE: ruijie_rg-x60-new-2410
+  ZEROWRT_DIST: ZeroWrt
+  PIPELINE: ${{ github.workspace }}/pipeline
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Compile RG-X60 New
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout build pipeline
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: wpm369079365/ZeroWrt
+          ref: ${{ inputs.pipeline_ref }}
+          path: pipeline
+          fetch-depth: 1
+
+      - name: Show runner and source commit
+        run: |
+          python3 --version
+          uname -a
+          echo "pipeline: $(git -C "$PIPELINE" rev-parse --short HEAD)"
+          echo "source:   $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD))"
+
+      - name: Prepare build space
+        run: |
+          python3 "$PIPELINE/scripts/zerowrt.py" system free-disk \
+            --build-dir "$BUILD_ROOT" \
+            --swap-gb 4 \
+            --reserve-gb 6 \
+            --min-free-gb 50
+
+      - name: Install build dependencies
+        run: python3 "$PIPELINE/scripts/zerowrt.py" system install-deps
+
+      # LLVM is deliberately not installed: the 24.10 tree builds with GCC 14,
+      # so the clang toolchain the 25.12 tree needs would only cost disk.
+
+      - name: Clone build source
+        run: |
+          python3 "$PIPELINE/scripts/zerowrt.py" source clone \
+            --dest "$ZEROWRT_SOURCE_DIR" \
+            --device "$ZEROWRT_DEVICE"
+
+      - name: Update feeds
+        run: python3 "$PIPELINE/scripts/zerowrt.py" source feeds-update --tree "$ZEROWRT_SOURCE_DIR"
+
+      - name: Install feeds
+        run: python3 "$PIPELINE/scripts/zerowrt.py" source feeds-install --tree "$ZEROWRT_SOURCE_DIR"
+
+      - name: Add external packages
+        run: python3 "$PIPELINE/scripts/zerowrt.py" packages add --tree "$ZEROWRT_SOURCE_DIR"
+
+      - name: Apply core customisations
+        env:
+          ZEROWRT_IP: ${{ inputs.lan_ip }}
+          ZEROWRT_ROOT_PASSWORD: ${{ inputs.root_password }}
+          ZEROWRT_WIFI_NAME: ${{ inputs.wifi_name }}
+          ZEROWRT_WIFI_PASSWORD: ${{ inputs.wifi_password }}
+        run: |
+          python3 "$PIPELINE/scripts/zerowrt.py" source customize \
+            --tree "$ZEROWRT_SOURCE_DIR" \
+            --assets "$PIPELINE/assets"
+
+      - name: Apply patches
+        run: |
+          python3 "$PIPELINE/scripts/zerowrt.py" patches apply \
+            --tree "$ZEROWRT_SOURCE_DIR" \
+            --device "$ZEROWRT_DEVICE"
+
+      - name: Apply device .config
+        run: |
+          python3 "$PIPELINE/scripts/zerowrt.py" config apply \
+            --tree "$ZEROWRT_SOURCE_DIR" \
+            --device "$ZEROWRT_DEVICE"
+
+      - name: Embed OTA metadata
+        env:
+          OTA_URL_INPUT: ${{ inputs.ota_url }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          if [ -n "$OTA_URL_INPUT" ]; then
+            OTA_URL="$OTA_URL_INPUT"
+          else
+            OWNER="$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+            REPO_NAME="${GITHUB_REPOSITORY#*/}"
+            OTA_URL="https://${OWNER}.github.io/${REPO_NAME}/ota.json"
+          fi
+          python3 "$PIPELINE/scripts/zerowrt.py" ota embed \
+            --tree "$ZEROWRT_SOURCE_DIR" \
+            --api-url "$OTA_URL" \
+            --emit "$GITHUB_WORKSPACE/ota-meta.json"
+
+      - name: Restore toolchain cache
+        if: ${{ inputs.cache_toolchain }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 "$PIPELINE/scripts/zerowrt.py" cache restore \
+            --tree "$ZEROWRT_SOURCE_DIR" \
+            --repo "$GITHUB_REPOSITORY"
+
+      - name: Download source archives
+        env:
+          TMPDIR: /builder/tmp
+        run: |
+          mkdir -p "$TMPDIR"
+          python3 "$PIPELINE/scripts/zerowrt.py" build download \
+            --tree "$ZEROWRT_SOURCE_DIR" \
+            --jobs "$(nproc)"
+
+      - name: Compile firmware
+        env:
+          TMPDIR: /builder/tmp
+        run: |
+          python3 "$PIPELINE/scripts/zerowrt.py" build compile \
+            --tree "$ZEROWRT_SOURCE_DIR" \
+            --jobs "$(nproc)"
+
+      - name: Collect artifacts
+        run: |
+          python3 "$PIPELINE/scripts/zerowrt.py" build collect \
+            --tree "$ZEROWRT_SOURCE_DIR" \
+            --out "$GITHUB_WORKSPACE/dist"
+
+      - name: Generate OTA index
+        run: |
+          python3 "$PIPELINE/scripts/zerowrt.py" ota index \
+            --tree "$ZEROWRT_SOURCE_DIR" \
+            --dist "$GITHUB_WORKSPACE/dist" \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$ZEROWRT_DEVICE"
+
+      - name: Build summary
+        if: success()
+        run: |
+          {
+            echo "## RG-X60 New (ImmortalWrt 24.10)"
+            echo '```'
+            cat "$GITHUB_WORKSPACE/dist/BUILD_INFO.txt"
+            echo
+            ls -lh "$GITHUB_WORKSPACE/dist"
+            echo '```'
+            echo "### SHA256"
+            echo '```'
+            cat "$GITHUB_WORKSPACE/dist/SHA256SUMS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: ${{ env.ZEROWRT_DEVICE }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish device release
+        if: success()
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          tag_name: ${{ env.ZEROWRT_DEVICE }}
+          name: ${{ env.ZEROWRT_DEVICE }}
+          target_commitish: ${{ github.sha }}
+          body_path: dist/BUILD_INFO.txt
+          files: dist/*
+          draft: false
+          prerelease: false
+          overwrite_files: true
+          fail_on_unmatched_files: false
+
+      - name: Publish OTA page
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OTA_CNAME: ${{ inputs.ota_cname }}
+        run: |
+          python3 "$PIPELINE/scripts/zerowrt.py" ota publish \
+            --tree "$ZEROWRT_SOURCE_DIR" \
+            --dist "$GITHUB_WORKSPACE/dist" \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$ZEROWRT_DEVICE" \
+            --branch gh-pages \
+            --site "$ZEROWRT_SOURCE_DIR/package/new/luci-app-ota/site" \
+            --cname "$OTA_CNAME"
+
+      - name: Trim build logs
+        if: failure()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          for log in build download defconfig feeds-update feeds-install toolchain; do
+            if [ -f "$ZEROWRT_SOURCE_DIR/$log.log" ]; then
+              tail -n 3000 "$ZEROWRT_SOURCE_DIR/$log.log" > "$GITHUB_WORKSPACE/dist/$log-tail.log"
+            fi
+          done
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: ${{ env.ZEROWRT_DEVICE }}-logs
+          path: dist/*-tail.log
+          if-no-files-found: ignore
+          retention-days: 7
